@@ -66,10 +66,10 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None):
+def _create_vit_backbone(compile_mode=None, img_size=1008):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
-        img_size=1008,
+        img_size=img_size,
         pretrain_img_size=336,
         patch_size=14,
         embed_dim=1024,
@@ -496,13 +496,15 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, image_size=1008
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=image_size)
     # ViT backbone
-    vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
+    vit_backbone: ViT = _create_vit_backbone(
+        compile_mode=compile_mode, img_size=image_size
+    )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
@@ -529,6 +531,12 @@ def _load_checkpoint(model, checkpoint_path):
     sam3_image_ckpt = {
         k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
     }
+    # When running at a different resolution, RoPE caches (freqs_cis) and related
+    # positional buffers will have different shapes; drop them so they are
+    # re-computed for the current image size instead of erroring on load.
+    def _is_positional_buffer(key: str) -> bool:
+        return "freqs_cis" in key or "relative_coords" in key
+    sam3_image_ckpt = {k: v for k, v in sam3_image_ckpt.items() if not _is_positional_buffer(k)}
     if model.inst_interactive_predictor is not None:
         sam3_image_ckpt.update(
             {
@@ -563,6 +571,7 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    image_size=1008,
 ):
     """
     Build SAM3 image model
@@ -575,6 +584,7 @@ def build_sam3_image_model(
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
         compile_mode: To enable compilation, set to "default"
+        image_size: Square resize used by the vision backbone and position encodings
 
     Returns:
         A SAM3 image model
@@ -586,7 +596,9 @@ def build_sam3_image_model(
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        compile_mode=compile_mode,
+        enable_inst_interactivity=enable_inst_interactivity,
+        image_size=image_size,
     )
 
     # Create text components

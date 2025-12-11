@@ -60,7 +60,11 @@ def compute_axial_cis(
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[-2], x.shape[-1])
+    if freqs_cis.shape != (x.shape[-2], x.shape[-1]):
+        raise AssertionError(
+            f"freqs_cis shape {freqs_cis.shape} does not match q/k shape "
+            f"({x.shape[-2]}, {x.shape[-1]}); ndim={ndim}"
+        )
     shape = [d if i >= ndim - 2 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
@@ -461,6 +465,30 @@ class Attention(nn.Module):
             return q, k
 
         assert self.freqs_cis is not None
+        # If the cached RoPE grid does not match the current sequence length
+        # (e.g., running at a different resolution), recompute it on the fly.
+        if self.freqs_cis.shape[0] != q.shape[-2] or self.freqs_cis.shape[1] != q.shape[-1]:
+            target_len = q.shape[-2]
+            target_hw = int(math.sqrt(target_len))
+            # Scale based on training rope_pt_size if available.
+            scale_pos = 1.0
+            if self.rope_pt_size is not None:
+                base_h = self.rope_pt_size[0] if isinstance(self.rope_pt_size, tuple) else self.rope_pt_size
+                scale_pos = base_h / target_hw
+            freqs_cis = self.compute_cis(
+                end_x=target_hw,
+                end_y=target_hw,
+                scale_pos=scale_pos,
+            ).to(q.device)
+            if self.cls_token:
+                t = torch.zeros(
+                    self.head_dim // 2,
+                    dtype=torch.float32,
+                    device=freqs_cis.device,
+                )
+                cls_freqs_cis = torch.polar(torch.ones_like(t), t)[None, :]
+                freqs_cis = torch.cat([cls_freqs_cis, freqs_cis], dim=0)
+            self.freqs_cis = freqs_cis
         return apply_rotary_enc(q, k, freqs_cis=self.freqs_cis)
 
     def forward(self, x: Tensor) -> Tensor:
